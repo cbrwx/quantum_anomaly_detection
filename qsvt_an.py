@@ -1,15 +1,20 @@
 import numpy as np
-from qiskit import QuantumCircuit, Aer, execute, IBMQ
+from qiskit import QuantumCircuit, Aer, execute, IBMQ, transpile
 from qiskit.opflow import AerPauliExpectation, CircuitSampler, StateFn
 from qiskit.algorithms import QSVT
 import pandas as pd
+from scipy.spatial import KDTree
+from qiskit.ignis.mitigation.measurement import CompleteMeasFitter
+from concurrent.futures import ThreadPoolExecutor
+from qiskit.circuit.library import QFT
 
 # Load IBM Q credentials
-IBMQ.load_account()
+# IBMQ.load_account() # (Load cred from file; if security is a concern)
+IBMQ.enable_account('your_api_token') # https://quantum-computing.ibm.com/
 
 # Choose the IBM Q backend to run the circuit on
 provider = IBMQ.get_provider(hub='ibm-q')
-backend = provider.get_backend('ibmq_16_melbourne')
+backend = provider.get_backend('ibmq_16_melbourne') # Stronger ones might be needed depending on your dataset
 
 # Define the quantum circuit for encoding the dataset
 def encode_dataset(dataset):
@@ -17,55 +22,86 @@ def encode_dataset(dataset):
     num_qubits = 2 * num_features
     circuit = QuantumCircuit(num_qubits)
 
-    # Encode the dataset into the quantum state using amplitude encoding
+    # Encode the dataset into the quantum state using angle encoding
     for i in range(num_features):
-        circuit.h(i)
-        circuit.crz(dataset[0,i], i, num_features+i)
-        circuit.h(i)
+        circuit.ry(dataset[0, i], i)
+        circuit.crz(dataset[0, i], i, num_features + i)
+        circuit.ry(-dataset[0, i], i)
 
     return circuit
 
+from qiskit.circuit.library import QFT
+
 def swap_test_circuit(circuit1, circuit2):
     num_qubits = circuit1.num_qubits
-    swap_test = QuantumCircuit(num_qubits + 1)
+    swap_test = QuantumCircuit(num_qubits + 1, 1)
 
+    # Initialize the ancilla qubit
+    swap_test.h(0)
+
+    # Append circuits
     swap_test.compose(circuit1, qubits=range(1, num_qubits // 2 + 1), inplace=True)
     swap_test.compose(circuit2, qubits=range(num_qubits // 2 + 1, num_qubits + 1), inplace=True)
 
-    swap_test.h(0)
+    # Perform controlled-SWAP operations
     for i in range(1, num_qubits // 2 + 1):
         swap_test.cswap(0, i, num_qubits // 2 + i)
+
+    # Apply H-gate to the ancilla and measure
     swap_test.h(0)
+    swap_test.measure(0, 0)
 
     return swap_test
 
-def swap_test_probability(circuit):
-    circuit.measure_all()
-    job = execute(circuit, backend, shots=1000)
-    results = job.result().get_counts()
-    prob = (results.get('0', 0) - results.get('1', 0)) / 1000
+def swap_test_probability(swap_circuit):
+    result = execute(swap_circuit, backend=Aer.get_backend('qasm_simulator'), shots=1024).result()
+    counts = result.get_counts()
+    prob = counts.get('0', 0) / 1024
     return prob
 
 def qsvt(circuit):
-    # Define the operator corresponding to the circuit
-    state_fn = StateFn(circuit)
+    num_qubits = circuit.num_qubits
+    num_features = num_qubits // 2
 
-    # Define the observable corresponding to the largest eigenvalue
-    observable = state_fn.adjoint().compose(state_fn)
+    # Apply Quantum Phase Estimation (QPE)
+    qpe = QuantumCircuit(num_qubits, num_features)
+    qpe.compose(circuit, inplace=True)
+    qpe.append(QFT(num_features).inverse(), qubits=range(num_features))
 
-    # Define the expectation value calculator
-    backend_sv = Aer.get_backend('statevector_simulator')
-    sampler_sv = CircuitSampler(backend_sv)
-    expval = AerPauliExpectation().convert(observable)
+    # Measure the first n qubits
+    for i in range(num_features):
+        qpe.measure(i, i)
 
-    # Define the QSVT algorithm instance
-    algorithm = QSVT(observable, expval, sampler_sv)
+    # Run the circuit and extract the eigenvalue
+    counts = execute(qpe, backend=Aer.get_backend('qasm_simulator'), shots=1024).result().get_counts()
+    eigenvalue = 0
+    for key, value in counts.items():
+        phase = int(key, 2) / (2 ** num_features)
+        eigenvalue += value * phase
+    eigenvalue /= 1024
 
-    # Run the algorithm and extract the largest eigenvalue
-    result = algorithm.compute_minimum_eigenvalue()
-    largest_eigenvalue = result.eigenvalue.real
+    return eigenvalue
 
-    return largest_eigenvalue
+# Adaptive Thresholding Function
+def adaptive_threshold(dataset, k_nearest=15):  # Changed k_nearest to 15
+    kdtree = KDTree(dataset)
+    mean_distances = []
+
+    for point in dataset:
+        _, indices = kdtree.query(point, k_nearest + 1)
+        mean_distance = np.mean(np.linalg.norm(dataset[indices[1:]] - point, axis=1))
+        mean_distances.append(mean_distance)
+
+    mean_threshold = np.mean(mean_distances) + np.std(mean_distances)
+    return mean_threshold
+
+# Quantum Feature Importance Function
+def quantum_feature_importance(circuit, feature_index, num_features):
+    circuit_copy = circuit.copy()
+    circuit_copy.x(2 * feature_index)
+    circuit_copy.x(2 * feature_index + 1)
+    new_eigenvalue = qsvt(circuit_copy)
+    return new_eigenvalue
 
 # Define the function for anomaly detection
 def detect_anomalies(dataset, threshold):
@@ -90,9 +126,30 @@ dataset = df.to_numpy()
 # Encode the dataset into quantum circuits
 dataset_circuits = [encode_dataset(data_point) for data_point in dataset]
 
-# Perform QSVT on the entire dataset to find the threshold for anomaly detection
-eigenvalues = [qsvt(circuit) for circuit in dataset_circuits]
-threshold = np.mean(eigenvalues) - np.std(eigenvalues)
+# Optimize the quantum circuits
+optimized_circuits = [transpile(circuit, backend=backend) for circuit in dataset_circuits]
+
+# Run QSVT in batches
+batch_size = 10  # Adjust batch size as needed
+eigenvalues = []
+for i in range(0, len(optimized_circuits), batch_size):
+    batch_circuits = optimized_circuits[i:i + batch_size]
+    with ThreadPoolExecutor() as executor:
+        batch_eigenvalues = list(executor.map(qsvt, batch_circuits))
+    eigenvalues.extend(batch_eigenvalues)
+
+# Apply noise mitigation using CompleteMeasFitter
+cal_circuits, state_labels = CompleteMeasFitter(optimized_circuits).calibration_circuits()
+cal_job = execute(cal_circuits, backend=backend, shots=1000)
+cal_results = cal_job.result()
+meas_fitter = CompleteMeasFitter(cal_results, state_labels)
+mitigated_eigenvalues = meas_fitter.apply(eigenvalues)
+
+# Calculate the adaptive threshold for anomaly detection
+adaptive_thresh = adaptive_threshold(dataset)
+
+# Multiply the adaptive threshold with the eigenvalue-based threshold
+threshold = np.mean(eigenvalues) - (np.std(eigenvalues) * adaptive_thresh)
 
 # Detect anomalies in the dataset using the QSVT algorithm
 anomalies = detect_anomalies(dataset, threshold)
@@ -104,4 +161,14 @@ for i in range(len(anomalies)):
         swap_prob = swap_test_probability(swap_circuit)
         print(f"Similarity between anomaly {i} and anomaly {j}: {swap_prob}")
 
+# Calculate the quantum feature importance for each feature in the dataset
+num_features = dataset.shape[1]
+quantum_feature_importances = []
+for i in range(num_features):
+    feature_importance = 0
+    for j, circuit in enumerate(dataset_circuits):
+        feature_importance += quantum_feature_importance(circuit, i, num_features) * (1 if j in anomalies else 0)
+    quantum_feature_importances.append(feature_importance / len(anomalies))
+
 print('Anomalies:', anomalies)
+print('Quantum Feature Importances:', quantum_feature_importances)
