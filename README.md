@@ -15,7 +15,7 @@ This code perform anomaly detection and feature importance calculation using qua
 - **Noise mitigation:** The code applies noise mitigation using the CompleteMeasFitter class from Qiskit Ignis.
 - **Calculating similarity between anomalies:** The code performs a swap test between each pair of anomalies to compare their quantum states.
 - **Calculating quantum feature importances:** The code calculates the quantum feature importances for each feature in the dataset.
-- **The quantum_entropy function calculates the quantum entropy of a given dataset, which is a measure of the uncertainty or randomness associated with the quantum states.
+- **The quantum_entropy function calculates the quantum entropy of a given dataset, which is a measure of the uncertainty or randomness associated with the quantum states. 
 
 ## Requirements
 
