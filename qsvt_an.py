@@ -30,6 +30,32 @@ def encode_dataset(dataset):
 
     return circuit
 
+def quantum_entropy(dataset):
+    # Encode the dataset into quantum states
+    dataset_circuits = [encode_dataset(data_point) for data_point in dataset]
+
+    # Compute the density matrices for each data point
+    density_matrices = [StateFn(circuit).to_density_matrix() for circuit in dataset_circuits]
+
+    # Compute the entropy for each density matrix
+    entropies = [-np.trace(rho @ np.log2(rho)) for rho in density_matrices]
+
+    # Return the mean entropy across all data points
+    return np.mean(entropies)
+
+def quantum_entropy_feature_importance(dataset, feature_index):
+    # Remove the selected feature from the dataset
+    reduced_dataset = np.delete(dataset, feature_index, axis=1)
+
+    # Compute the quantum entropy of the original dataset and the reduced dataset
+    original_entropy = quantum_entropy(dataset)
+    reduced_entropy = quantum_entropy(reduced_dataset)
+
+    # Compute the importance of the feature as the difference in entropy
+    feature_importance = original_entropy - reduced_entropy
+
+    return feature_importance
+
 from qiskit.circuit.library import QFT
 
 def swap_test_circuit(circuit1, circuit2):
